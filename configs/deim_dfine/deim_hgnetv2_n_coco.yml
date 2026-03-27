@@ -1,0 +1,114 @@
+__include__: [
+  './dfine_hgnetv2_n_coco.yml',
+  '../base/deim.yml'
+]
+
+output_dir: ./deim_outputs/deim_hgnetv2_n_coco
+
+DEIM:
+  backbone: HGNetv2
+
+
+# HGNetv2_pcrt:
+#   name: 'B0'
+#   return_idx: [1, 2, 3]
+#   freeze_at: -1
+#   freeze_norm: False
+#   use_lab: True
+#   pretrained: True
+#   hvi_base_channels: 8
+#   fusion_stages: [2, 3]
+#   use_simple_fusion: True
+#   late_fusion: True
+
+
+
+# HGNetv2_pcrt:
+#   name: 'B0'
+#   return_idx: [1, 2, 3]
+#   freeze_at: -1
+#   freeze_norm: False
+#   use_lab: True
+#   pretrained: True
+#   hvi_base_channels: 12
+#   fusion_stages: [1, 2, 3]
+#   use_simple_fusion: False
+#   late_fusion: True
+
+
+GNetv2:
+  ame: 'B0'
+  eturn_idx: [2, 3]
+  reeze_at: -1
+  freeze_norm: False
+  se_lab: True
+  retrained: False
+
+
+
+
+HybridEncoder:
+  in_channels: [512, 1024]
+  feat_strides: [16, 32]
+
+  # intra
+  hidden_dim: 128
+  use_encoder_idx: [1]
+  dim_feedforward: 512
+
+  # cross
+  expansion: 0.34
+  depth_mult: 0.5
+
+
+DFINETransformer:
+  feat_channels: [128, 128]
+  feat_strides: [16, 32]
+  hidden_dim: 128
+  dim_feedforward: 512
+  num_levels: 2
+
+  num_layers: 3
+  eval_idx: -1
+
+  num_points: [6, 6]
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0004
+    -
+      params: '^(?=.*backbone)(?=.*norm|bn).*$'
+      lr: 0.0004
+      weight_decay: 0.
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0008
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# Increase to search for the optimal ema
+epoches: 160 # 148 + 12
+
+## Our LR-Scheduler
+flat_epoch: 7800    # 4 + epoch // 2, e.g., 40 = 4 + 72 / 2
+no_aug_epoch: 12
+lr_gamma: 1.0
+
+## Our DataAug
+train_dataloader: 
+  total_batch_size: 32
+  dataset: 
+    transforms:
+      policy:
+        epoch: [4, 78, 148]   # list 
+
+  collate_fn:
+    mixup_epochs: [4, 78]
+    stop_epoch: 148
+    base_size_repeat: ~
+val_dataloader: 
+  total_batch_size: 32
