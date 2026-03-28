@@ -11,8 +11,8 @@ train_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/naiben/WNB_Visual_Studio_Code/VSCode_Projects/Datasets/disease_l_coco/images/train
-    ann_file: /home/naiben/WNB_Visual_Studio_Code/VSCode_Projects/Datasets/disease_l_coco/annotations/train.json
+    img_folder: /home/Datasets/disease_l_coco/images/train
+    ann_file: /home/Datasets/disease_l_coco/annotations/train.json
     return_masks: False
     transforms:
       type: Compose
@@ -28,8 +28,8 @@ val_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /home/naiben/WNB_Visual_Studio_Code/VSCode_Projects/Datasets/disease_l_coco/images/test
-    ann_file: /home/naiben/WNB_Visual_Studio_Code/VSCode_Projects/Datasets/disease_l_coco/annotations/test.json
+    img_folder: /home/Datasets/disease_l_coco/images/test
+    ann_file: /home/Datasets/disease_l_coco/annotations/test.json
     return_masks: False
     transforms:
       type: Compose
