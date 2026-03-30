@@ -203,26 +203,26 @@ class TransformerDecoderLayer(nn.Module):
                 attn_mask=None,
                 query_pos_embed=None):
 
-        # self attention
+        # self attention    实现自注意力机制的残差连接和层归一化，这是Transformer块的核心部分
         q = k = self.with_pos_embed(target, query_pos_embed)
 
         target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
         target = target + self.dropout1(target2)
         target = self.norm1(target)
 
-        # cross attention
+        # cross attention   可变性交叉注意力（Deformable Cross Attention）
         target2 = self.cross_attn(\
-            self.with_pos_embed(target, query_pos_embed),
-            reference_points,
+            self.with_pos_embed(target, query_pos_embed),   #查询的位置编码
+            reference_points,   #参考点坐标
             value,
             spatial_shapes)
 
         target = self.gateway(target, self.dropout2(target2))
 
-        # ffn
+        # ffn   （前馈神经网络）层，   实现FFN层的残差连接和层归一化，完成Transformer块的第二个子层
         target2 = self.forward_ffn(target)
         target = target + self.dropout4(target2)
-        target = self.norm3(target.clamp(min=-65504, max=65504))
+        target = self.norm3(target.clamp(min=-65504, max=65504))    #限制数值范围,防止数值溢出
 
         return target
 
