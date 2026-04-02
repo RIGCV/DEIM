@@ -1,8 +1,8 @@
 """
 
-python train.py -c configs/deim_dfine/deim_hgnetv2_n_coco.yml --use-amp --seed=0
+python train.py -c configs/deim_dfine/deim_hgnetv2_n_disease.yml --use-amp --seed=0
 
-nohup python train.py -c configs/deim_dfine/deim_hgnetv2_n_coco.yml --use-amp --seed=0
+nohup python train.py -c configs/deim_dfine/deim_hgnetv2_n_disease.yml --use-amp --seed=0
 
 
 
