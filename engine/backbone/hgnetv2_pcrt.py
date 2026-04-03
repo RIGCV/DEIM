@@ -1,233 +1,191 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import os
-from .common import FrozenBatchNorm2d
-from ..core import register
-import logging
-# from .hvi import RGB_HVI
-from .pcrt import PRCT
-# Constants for initialization
-kaiming_normal_ = nn.init.kaiming_normal_
-zeros_ = nn.init.zeros_
-ones_ = nn.init.ones_
+import torch                      # 导入PyTorch主库
+import torch.nn as nn             # 导入神经网络模块
+import torch.nn.functional as F   # 导入函数式接口
+import os                         # 导入操作系统接口
+from .common import FrozenBatchNorm2d   # 导入冻结批归一化类
+from ..core import register       # 导入注册装饰器
+import logging                    # 导入日志模块
+# from .hvi import RGB_HVI        # 已注释：原本的HVI生成模块
+from .pcrt import PRCT            # 导入PRCT类，用于RGB到PRCT（HVI）转换
 
-__all__ = ['HGNetv2_pcrt']
+# Constants for initialization    # 初始化常量
+kaiming_normal_ = nn.init.kaiming_normal_   # Kaiming正态初始化别名
+zeros_ = nn.init.zeros_           # 全零初始化别名
+ones_ = nn.init.ones_             # 全1初始化别名
 
-
-class LearnableAffineBlock(nn.Module):
-    def __init__(self, scale_value=1.0, bias_value=0.0):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor([scale_value]), requires_grad=True)
-        self.bias = nn.Parameter(torch.tensor([bias_value]), requires_grad=True)
-
-    def forward(self, x):
-        return self.scale * x + self.bias
+__all__ = ['HGNetv2_pcrt']        # 模块公开接口列表
 
 
-class ConvBNAct(nn.Module):
-    def __init__(
-        self,
-        in_chs,
-        out_chs,
-        kernel_size,
-        stride=1,
-        groups=1,
-        padding='',
-        use_act=True,
-        use_lab=False
-    ):
-        super().__init__()
-        self.use_act = use_act
-        self.use_lab = use_lab
-        if padding == 'same':
-            self.conv = nn.Sequential(
-                nn.ZeroPad2d([0, 1, 0, 1]),
-                nn.Conv2d(in_chs, out_chs, kernel_size, stride, groups=groups, bias=False)
+class LearnableAffineBlock(nn.Module):   # 可学习仿射块
+    def __init__(self, scale_value=1.0, bias_value=0.0):   # 默认缩放1偏置0
+        super().__init__()        # 调用父类初始化
+        self.scale = nn.Parameter(torch.tensor([scale_value]), requires_grad=True)   # 可学习缩放参数
+        self.bias = nn.Parameter(torch.tensor([bias_value]), requires_grad=True)     # 可学习偏置参数
+
+    def forward(self, x):         # 前向传播
+        return self.scale * x + self.bias   # 输出 = 缩放×输入 + 偏置
+
+
+class ConvBNAct(nn.Module):       # 卷积+批归一化+激活函数模块
+    def __init__(self, in_chs, out_chs, kernel_size, stride=1, groups=1, padding='',
+                 use_act=True, use_lab=False):   # 参数列表
+        super().__init__()        # 父类初始化
+        self.use_act = use_act    # 是否使用激活函数
+        self.use_lab = use_lab    # 是否使用可学习仿射块
+        if padding == 'same':     # 如果需要'same'填充
+            self.conv = nn.Sequential(          # 顺序容器
+                nn.ZeroPad2d([0, 1, 0, 1]),     # 右下角填充1行/列
+                nn.Conv2d(in_chs, out_chs, kernel_size, stride, groups=groups, bias=False)   # 无偏置卷积
             )
-        else:
-            self.conv = nn.Conv2d(
-                in_chs, out_chs, kernel_size, stride,
-                padding=(kernel_size - 1) // 2, groups=groups, bias=False
-            )
-        self.bn = nn.BatchNorm2d(out_chs)
-        self.act = nn.ReLU() if self.use_act else nn.Identity()
-        self.lab = LearnableAffineBlock() if (self.use_act and self.use_lab) else nn.Identity()
+        else:                     # 默认对称填充
+            self.conv = nn.Conv2d(in_chs, out_chs, kernel_size, stride,
+                                  padding=(kernel_size - 1) // 2, groups=groups, bias=False)   # 保持尺寸
+        self.bn = nn.BatchNorm2d(out_chs)       # 批归一化层
+        self.act = nn.ReLU() if self.use_act else nn.Identity()   # 激活或恒等
+        self.lab = LearnableAffineBlock() if (self.use_act and self.use_lab) else nn.Identity()   # LAB或恒等
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.act(x)
-        x = self.lab(x)
-        return x
+    def forward(self, x):         # 前向传播
+        x = self.conv(x)          # 卷积操作
+        x = self.bn(x)            # 批归一化
+        x = self.act(x)           # 激活函数
+        x = self.lab(x)           # 可学习仿射（若启用）
+        return x                  # 返回结果
 
 
-class LightConvBNAct(nn.Module):
-    def __init__(self, in_chs, out_chs, kernel_size, groups=1, use_lab=False):
-        super().__init__()
-        self.conv1 = ConvBNAct(in_chs, out_chs, kernel_size=1, use_act=False, use_lab=use_lab)
-        self.conv2 = ConvBNAct(out_chs, out_chs, kernel_size=kernel_size, groups=out_chs, use_act=True, use_lab=use_lab)
+class LightConvBNAct(nn.Module):  # 轻量卷积块：1x1卷积 + 深度可分离卷积
+    def __init__(self, in_chs, out_chs, kernel_size, groups=1, use_lab=False):   # 初始化
+        super().__init__()        # 父类初始化
+        self.conv1 = ConvBNAct(in_chs, out_chs, kernel_size=1, use_act=False, use_lab=use_lab)   # 点卷积，无激活
+        self.conv2 = ConvBNAct(out_chs, out_chs, kernel_size=kernel_size, groups=out_chs, use_act=True, use_lab=use_lab)   # 深度卷积
 
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x
-
-
-class StemBlock(nn.Module):
-    def __init__(self, in_chs, mid_chs, out_chs, use_lab=False):
-        super().__init__()
-        self.stem1 = ConvBNAct(in_chs, mid_chs, kernel_size=3, stride=2, use_lab=use_lab)
-        self.stem2a = ConvBNAct(mid_chs, mid_chs // 2, kernel_size=2, stride=1, use_lab=use_lab)
-        self.stem2b = ConvBNAct(mid_chs // 2, mid_chs, kernel_size=2, stride=1, use_lab=use_lab)
-        self.stem3 = ConvBNAct(mid_chs * 2, mid_chs, kernel_size=3, stride=2, use_lab=use_lab)
-        self.stem4 = ConvBNAct(mid_chs, out_chs, kernel_size=1, stride=1, use_lab=use_lab)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=1, ceil_mode=True)
-
-    def forward(self, x):
-        x = self.stem1(x)
-        x = F.pad(x, (0, 1, 0, 1))
-        x2 = self.stem2a(x)
-        x2 = F.pad(x2, (0, 1, 0, 1))
-        x2 = self.stem2b(x2)
-        x1 = self.pool(x)
-        x = torch.cat([x1, x2], dim=1)
-        x = self.stem3(x)
-        x = self.stem4(x)
-        return x
+    def forward(self, x):         # 前向传播
+        x = self.conv1(x)         # 点卷积升/降维
+        x = self.conv2(x)         # 深度卷积提取空间特征
+        return x                  # 返回结果
 
 
-class EseModule(nn.Module):
-    def __init__(self, chs):
-        super().__init__()
-        self.conv = nn.Conv2d(chs, chs, kernel_size=1, stride=1, padding=0)
-        self.sigmoid = nn.Sigmoid()
+class StemBlock(nn.Module):       # 初始stem模块：下采样+特征组合
+    def __init__(self, in_chs, mid_chs, out_chs, use_lab=False):   # 初始化
+        super().__init__()        # 父类初始化
+        self.stem1 = ConvBNAct(in_chs, mid_chs, kernel_size=3, stride=2, use_lab=use_lab)   # 步长2下采样
+        self.stem2a = ConvBNAct(mid_chs, mid_chs // 2, kernel_size=2, stride=1, use_lab=use_lab)   # 分支a：减半通道
+        self.stem2b = ConvBNAct(mid_chs // 2, mid_chs, kernel_size=2, stride=1, use_lab=use_lab)   # 分支b：恢复通道
+        self.stem3 = ConvBNAct(mid_chs * 2, mid_chs, kernel_size=3, stride=2, use_lab=use_lab)     # 下采样并降维
+        self.stem4 = ConvBNAct(mid_chs, out_chs, kernel_size=1, stride=1, use_lab=use_lab)         # 1x1卷积调整通道
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=1, ceil_mode=True)   # 最大池化，ceil模式
 
-    def forward(self, x):
-        identity = x
-        x = x.mean((2, 3), keepdim=True)
-        x = self.conv(x)
-        x = self.sigmoid(x)
-        return torch.mul(identity, x)
-class HG_Block(nn.Module):
-    def __init__(
-        self,
-        in_chs,
-        mid_chs,
-        out_chs,
-        layer_num,
-        kernel_size=3,
-        residual=False,
-        light_block=False,
-        use_lab=False,
-        agg='ese',
-        drop_path=0.,
-    ):
-        super().__init__()
-        self.residual = residual
-
-        self.layers = nn.ModuleList()
-        for i in range(layer_num):
-            if light_block:
-                self.layers.append(
-                    LightConvBNAct(in_chs if i == 0 else mid_chs, mid_chs, kernel_size=kernel_size, use_lab=use_lab)
-                )
-            else:
-                self.layers.append(
-                    ConvBNAct(in_chs if i == 0 else mid_chs, mid_chs, kernel_size=kernel_size, stride=1, use_lab=use_lab)
-                )
-
-        total_chs = in_chs + layer_num * mid_chs
-        if agg == 'se':
-            aggregation_squeeze_conv = ConvBNAct(total_chs, out_chs // 2, kernel_size=1, stride=1, use_lab=use_lab)
-            aggregation_excitation_conv = ConvBNAct(out_chs // 2, out_chs, kernel_size=1, stride=1, use_lab=use_lab)
-            self.aggregation = nn.Sequential(aggregation_squeeze_conv, aggregation_excitation_conv)
-        else:
-            aggregation_conv = ConvBNAct(total_chs, out_chs, kernel_size=1, stride=1, use_lab=use_lab)
-            att = EseModule(out_chs)
-            self.aggregation = nn.Sequential(aggregation_conv, att)
-
-        self.drop_path = nn.Dropout(drop_path) if drop_path else nn.Identity()
-
-    def forward(self, x):
-        identity = x
-        outputs = [x]
-        for layer in self.layers:
-            x = layer(x)
-            outputs.append(x)
-        x = torch.cat(outputs, dim=1)
-        x = self.aggregation(x)
-        if self.residual:
-            x = self.drop_path(x) + identity
-        return x
+    def forward(self, x):         # 前向传播
+        x = self.stem1(x)         # 第一次卷积+下采样
+        x = F.pad(x, (0, 1, 0, 1))   # 右侧和下侧填充1行/列
+        x2 = self.stem2a(x)       # 分支a处理
+        x2 = F.pad(x2, (0, 1, 0, 1))   # 再次填充
+        x2 = self.stem2b(x2)      # 分支b处理
+        x1 = self.pool(x)         # 池化分支
+        x = torch.cat([x1, x2], dim=1)   # 沿通道拼接
+        x = self.stem3(x)         # 下采样卷积
+        x = self.stem4(x)         # 最终通道调整
+        return x                  # 返回结果
 
 
-class HG_Stage(nn.Module):
-    def __init__(
-        self,
-        in_chs,
-        mid_chs,
-        out_chs,
-        block_num,
-        layer_num,
-        downsample=True,
-        light_block=False,
-        kernel_size=3,
-        use_lab=False,
-        agg='se',
-        drop_path=0.,
-    ):
-        super().__init__()
-        self.downsample = ConvBNAct(
-            in_chs, in_chs, kernel_size=3, stride=2, groups=in_chs, use_act=False, use_lab=use_lab
-        ) if downsample else nn.Identity()
+class EseModule(nn.Module):       # ESE通道注意力模块
+    def __init__(self, chs):      # 初始化
+        super().__init__()        # 父类初始化
+        self.conv = nn.Conv2d(chs, chs, kernel_size=1, stride=1, padding=0)   # 1x1卷积
+        self.sigmoid = nn.Sigmoid()   # Sigmoid激活
 
-        blocks_list = []
-        for i in range(block_num):
-            blocks_list.append(
-                HG_Block(
-                    in_chs if i == 0 else out_chs,
-                    mid_chs,
-                    out_chs,
-                    layer_num,
-                    residual=False if i == 0 else True,
-                    kernel_size=kernel_size,
-                    light_block=light_block,
-                    use_lab=use_lab,
-                    agg=agg,
-                    drop_path=drop_path[i] if isinstance(drop_path, (list, tuple)) else drop_path,
-                )
-            )
-        self.blocks = nn.Sequential(*blocks_list)
-
-    def forward(self, x):
-        x = self.downsample(x)
-        x = self.blocks(x)
-        return x
+    def forward(self, x):         # 前向传播
+        identity = x              # 保存残差输入
+        x = x.mean((2, 3), keepdim=True)   # 全局平均池化 → [B,C,1,1]
+        x = self.conv(x)          # 1x1卷积学习权重
+        x = self.sigmoid(x)       # Sigmoid得到0~1权重
+        return torch.mul(identity, x)   # 注意力加权
 
 
-class FusionBlock(nn.Module):
-    """简单可靠的中层融合：concat -> 1x1 Conv -> BN -> ReLU"""
-    def __init__(self, in_ch_each):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch_each * 2, in_ch_each, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(in_ch_each)
-        self.act = nn.ReLU(inplace=True)
+class HG_Block(nn.Module):        # HGNet基本块：多分支叠加+聚合
+    def __init__(self, in_chs, mid_chs, out_chs, layer_num, kernel_size=3, residual=False,
+                 light_block=False, use_lab=False, agg='ese', drop_path=0.):   # 参数列表
+        super().__init__()        # 父类初始化
+        self.residual = residual  # 保存残差标志
+        self.layers = nn.ModuleList()   # 模块列表容器
+        for i in range(layer_num):   # 循环构建每一层
+            if light_block:        # 如果使用轻量块
+                self.layers.append(LightConvBNAct(in_chs if i == 0 else mid_chs, mid_chs,
+                                                  kernel_size=kernel_size, use_lab=use_lab))   # 轻量卷积
+            else:                  # 否则使用标准卷积块
+                self.layers.append(ConvBNAct(in_chs if i == 0 else mid_chs, mid_chs,
+                                             kernel_size=kernel_size, stride=1, use_lab=use_lab))   # 标准卷积
+        total_chs = in_chs + layer_num * mid_chs   # 所有层输出通道总和（含输入）
+        if agg == 'se':            # SE聚合方式
+            aggregation_squeeze_conv = ConvBNAct(total_chs, out_chs // 2, kernel_size=1, stride=1, use_lab=use_lab)   # 降维
+            aggregation_excitation_conv = ConvBNAct(out_chs // 2, out_chs, kernel_size=1, stride=1, use_lab=use_lab)   # 升维
+            self.aggregation = nn.Sequential(aggregation_squeeze_conv, aggregation_excitation_conv)   # SE顺序容器
+        else:                      # ESE聚合方式
+            aggregation_conv = ConvBNAct(total_chs, out_chs, kernel_size=1, stride=1, use_lab=use_lab)   # 1x1卷积
+            att = EseModule(out_chs)   # ESE注意力
+            self.aggregation = nn.Sequential(aggregation_conv, att)   # 卷积+注意力
+        self.drop_path = nn.Dropout(drop_path) if drop_path else nn.Identity()   # DropPath或恒等
 
-    def forward(self, frgb, fhvi):
-        x = torch.cat([frgb, fhvi], dim=1)
-        x = self.act(self.bn(self.conv(x)))
-        return x
+    def forward(self, x):         # 前向传播
+        identity = x              # 保存残差输入
+        outputs = [x]             # 输出列表，初始含输入
+        for layer in self.layers: # 逐层处理
+            x = layer(x)          # 当前层输出
+            outputs.append(x)     # 添加到列表
+        x = torch.cat(outputs, dim=1)   # 沿通道拼接
+        x = self.aggregation(x)   # 聚合处理
+        if self.residual:         # 如果使用残差
+            x = self.drop_path(x) + identity   # 随机丢弃路径后加残差
+        return x                  # 返回结果
 
 
-@register()
-class HGNetv2_pcrt(nn.Module):
+class HG_Stage(nn.Module):        # HGNet阶段：下采样 + 多个HG_Block
+    def __init__(self, in_chs, mid_chs, out_chs, block_num, layer_num, downsample=True,
+                 light_block=False, kernel_size=3, use_lab=False, agg='se', drop_path=0.):   # 参数列表
+        super().__init__()        # 父类初始化
+        self.downsample = ConvBNAct(in_chs, in_chs, kernel_size=3, stride=2, groups=in_chs,
+                                    use_act=False, use_lab=use_lab) if downsample else nn.Identity()   # 下采样或恒等
+        blocks_list = []          # 块列表
+        for i in range(block_num):   # 循环构建每个HG_Block
+            blocks_list.append(HG_Block(
+                in_chs if i == 0 else out_chs,   # 第一个块输入为in_chs，之后为out_chs
+                mid_chs, out_chs, layer_num,
+                residual=False if i == 0 else True,   # 第一个块无残差，之后有残差
+                kernel_size=kernel_size,
+                light_block=light_block,
+                use_lab=use_lab,
+                agg=agg,
+                drop_path=drop_path[i] if isinstance(drop_path, (list, tuple)) else drop_path   # 支持逐块丢弃率
+            ))
+        self.blocks = nn.Sequential(*blocks_list)   # 顺序容器包装
+
+    def forward(self, x):         # 前向传播
+        x = self.downsample(x)    # 下采样（若启用）
+        x = self.blocks(x)        # 通过所有块
+        return x                  # 返回结果
+
+
+class FusionBlock(nn.Module):     # 简单融合模块：concat + 1x1卷积 + BN + ReLU
+    """简单可靠的中层融合：concat -> 1x1 Conv -> BN -> ReLU"""   # 文档字符串
+    def __init__(self, in_ch_each):   # 初始化
+        super().__init__()        # 父类初始化
+        self.conv = nn.Conv2d(in_ch_each * 2, in_ch_each, kernel_size=1, bias=False)   # 1x1卷积，双倍输入
+        self.bn = nn.BatchNorm2d(in_ch_each)   # 批归一化
+        self.act = nn.ReLU(inplace=True)       # 就地ReLU
+
+    def forward(self, frgb, fhvi):   # 前向传播
+        x = torch.cat([frgb, fhvi], dim=1)   # 沿通道拼接
+        x = self.act(self.bn(self.conv(x)))  # 卷积->BN->ReLU
+        return x                  # 返回融合结果
+
+
+@register()                       # 注册装饰器
+class HGNetv2_pcrt(nn.Module):    # 双分支HGNetv2，支持RGB和PRCT(HVI)模态融合
     """
     双分支：RGB 与 由 RGB_HVI 生成的 HVI
     在 stage2 / stage3 的分辨率处做特征交互融合
     """
-    arch_configs = {
-        'B0': {
+    arch_configs = {              # 架构配置字典
+        'B0': {                   # B0配置
             'stem_channels': [3, 16, 16],
             'stage_config': {
                 "stage1": [16, 16, 64, 1, False, False, 3, 3],
@@ -237,7 +195,7 @@ class HGNetv2_pcrt(nn.Module):
             },
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B0_stage1.pth'
         },
-        'B1': {
+        'B1': {                   # B1配置
             'stem_channels': [3, 24, 32],
             'stage_config': {
                 "stage1": [32, 32, 64, 1, False, False, 3, 3],
@@ -247,7 +205,7 @@ class HGNetv2_pcrt(nn.Module):
             },
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B1_stage1.pth'
         },
-        'B2': {
+        'B2': {                   # B2配置
             'stem_channels': [3, 24, 32],
             'stage_config': {
                 "stage1": [32, 32, 96, 1, False, False, 3, 4],
@@ -257,7 +215,7 @@ class HGNetv2_pcrt(nn.Module):
             },
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B2_stage1.pth'
         },
-        'B3': {
+        'B3': {                   # B3配置
             'stem_channels': [3, 24, 32],
             'stage_config': {
                 "stage1": [32, 32, 128, 1, False, False, 3, 5],
@@ -267,7 +225,7 @@ class HGNetv2_pcrt(nn.Module):
             },
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B3_stage1.pth'
         },
-        'B4': {
+        'B4': {                   # B4配置
             'stem_channels': [3, 32, 48],
             'stage_config': {
                 "stage1": [48, 48, 128, 1, False, False, 3, 6],
@@ -277,7 +235,7 @@ class HGNetv2_pcrt(nn.Module):
             },
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B4_stage1.pth'
         },
-        'B5': {
+        'B5': {                   # B5配置
             'stem_channels': [3, 32, 64],
             'stage_config': {
                 "stage1": [64, 64, 128, 1, False, False, 3, 6],
@@ -287,7 +245,7 @@ class HGNetv2_pcrt(nn.Module):
             },
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B5_stage1.pth'
         },
-        'B6': {
+        'B6': {                   # B6配置
             'stem_channels': [3, 48, 96],
             'stage_config': {
                 "stage1": [96, 96, 192, 2, False, False, 3, 6],
@@ -298,148 +256,125 @@ class HGNetv2_pcrt(nn.Module):
             'url': 'https://github.com/Peterande/storage/releases/download/dfinev1.0/PPHGNetV2_B6_stage1.pth'
         },
     }
-    def __init__(
-            self,
-            name,
-            use_lab=False,
-            return_idx=[1, 2, 3],
-            freeze_stem_only=True,
-            freeze_at=0,
-            freeze_norm=True,
-            pretrained=True,
-            local_model_dir='weight/hgnetv2/'
-        ):
-            super().__init__()
-            self.use_lab = use_lab
-            self.return_idx = return_idx
+    def __init__(self, name, use_lab=False, return_idx=[1, 2, 3], freeze_stem_only=True,
+                 freeze_at=0, freeze_norm=True, pretrained=True, local_model_dir='weight/hgnetv2/'):   # 初始化参数
+        super().__init__()        # 父类初始化
+        self.use_lab = use_lab    # 保存use_lab标志
+        self.return_idx = return_idx   # 要返回的阶段索引
 
-            # 伪模态生成器（RGB -> HVI 3ch）
-            self.rgb2hvi = PRCT()
+        # 伪模态生成器（RGB -> HVI 3ch）
+        self.rgb2hvi = PRCT()     # 实例化PRCT转换器
 
-            stem_channels = self.arch_configs[name]['stem_channels']
-            stage_config = self.arch_configs[name]['stage_config']
-            download_url = self.arch_configs[name]['url']
+        stem_channels = self.arch_configs[name]['stem_channels']   # 获取stem通道配置
+        stage_config = self.arch_configs[name]['stage_config']     # 获取阶段配置
+        download_url = self.arch_configs[name]['url']              # 获取预训练URL
 
-            self._out_strides = [4, 8, 16, 32]
-            self._out_channels = [stage_config[k][2] for k in stage_config]
+        self._out_strides = [4, 8, 16, 32]   # 各阶段下采样倍数
+        self._out_channels = [stage_config[k][2] for k in stage_config]   # 各阶段输出通道
 
-            # === 双分支 stem（参数不共享，更稳） ===
-            self.stem_rgb = StemBlock(
-                in_chs=stem_channels[0], mid_chs=stem_channels[1], out_chs=stem_channels[2], use_lab=use_lab
-            )
-            self.stem_hvi = StemBlock(
-                in_chs=3, mid_chs=stem_channels[1], out_chs=stem_channels[2], use_lab=use_lab
-            )
+        # === 双分支 stem（参数不共享） ===
+        self.stem_rgb = StemBlock(in_chs=stem_channels[0], mid_chs=stem_channels[1],
+                                  out_chs=stem_channels[2], use_lab=use_lab)   # RGB分支stem
+        self.stem_hvi = StemBlock(in_chs=3, mid_chs=stem_channels[1],
+                                  out_chs=stem_channels[2], use_lab=use_lab)   # HVI分支stem
 
-            # === 双分支 stages（参数不共享）===
-            self.stages_rgb = nn.ModuleList()
-            self.stages_hvi = nn.ModuleList()
-            for i, k in enumerate(stage_config):
-                in_channels, mid_channels, out_channels, block_num, downsample, light_block, kernel_size, layer_num = stage_config[k]
-                self.stages_rgb.append(
-                    HG_Stage(in_channels, mid_channels, out_channels, block_num, layer_num, downsample, light_block, kernel_size, use_lab)
-                )
-                self.stages_hvi.append(
-                    HG_Stage(in_channels, mid_channels, out_channels, block_num, layer_num, downsample, light_block, kernel_size, use_lab)
-                )
+        # === 双分支 stages（参数不共享） ===
+        self.stages_rgb = nn.ModuleList()   # RGB阶段容器
+        self.stages_hvi = nn.ModuleList()   # HVI阶段容器
+        for i, k in enumerate(stage_config):   # 遍历阶段配置
+            in_c, mid_c, out_c, block_num, downsample, light_block, ksize, layer_num = stage_config[k]   # 解包
+            self.stages_rgb.append(HG_Stage(in_c, mid_c, out_c, block_num, layer_num,
+                                            downsample, light_block, ksize, use_lab))   # 添加RGB阶段
+            self.stages_hvi.append(HG_Stage(in_c, mid_c, out_c, block_num, layer_num,
+                                            downsample, light_block, ksize, use_lab))   # 添加HVI阶段
 
-            # === 融合模块：在 stage2 / stage3 处交互 ===
-            # 对齐 channels：stage2 的 in/out 通道可从配置读出
-            # stage2 输出通道：
-            stage_names = list(stage_config.keys())
-            ch_stage2_out = stage_config[stage_names[1]][2]
-            ch_stage3_out = stage_config[stage_names[2]][2]
-            self.fuse2 = FusionBlock(in_ch_each=ch_stage2_out)
-            self.fuse3 = FusionBlock(in_ch_each=ch_stage3_out)
+        # === 融合模块：stage2 / stage3 交互 ===
+        stage_names = list(stage_config.keys())   # 阶段名称列表
+        ch_stage2_out = stage_config[stage_names[1]][2]   # stage2输出通道
+        ch_stage3_out = stage_config[stage_names[2]][2]   # stage3输出通道
+        self.fuse2 = FusionBlock(in_ch_each=ch_stage2_out)   # stage2融合模块
+        self.fuse3 = FusionBlock(in_ch_each=ch_stage3_out)   # stage3融合模块
 
-            # === 冻结、归一化冻结 ===
-            if freeze_at >= 0:
-                self._freeze_parameters(self.stem_rgb)
-                self._freeze_parameters(self.stem_hvi)
-                if not freeze_stem_only:
-                    for i in range(min(freeze_at + 1, len(self.stages_rgb))):
-                        self._freeze_parameters(self.stages_rgb[i])
-                        self._freeze_parameters(self.stages_hvi[i])
+        # === 冻结参数 ===
+        if freeze_at >= 0:        # 需要冻结
+            self._freeze_parameters(self.stem_rgb)   # 冻结RGB stem
+            self._freeze_parameters(self.stem_hvi)   # 冻结HVI stem
+            if not freeze_stem_only:   # 如果不是仅冻结stem
+                for i in range(min(freeze_at + 1, len(self.stages_rgb))):   # 前freeze_at+1个阶段
+                    self._freeze_parameters(self.stages_rgb[i])   # 冻结RGB阶段
+                    self._freeze_parameters(self.stages_hvi[i])   # 冻结HVI阶段
 
-            if freeze_norm:
-                self._freeze_norm(self)
+        if freeze_norm:            # 需要冻结归一化层
+            self._freeze_norm(self)   # 递归替换BN为冻结版本
 
-            # === 预训练权重：仅加载与原版同名的键，其余跳过（strict=False）===
-            if pretrained:
-                RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
-                try:
-                    model_path = os.path.join(local_model_dir, f'PPHGNetV2_{name}_stage1.pth')
-                    if os.path.exists(model_path):
-                        state = torch.load(model_path, map_location='cpu')
-                        print(f"Loaded stage1 {name} HGNetV2 from local file.")
+        # === 加载预训练权重（仅RGB分支） ===
+        if pretrained:             # 需要预训练
+            RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"   # 终端颜色
+            try:                   # 尝试加载
+                model_path = os.path.join(local_model_dir, f'PPHGNetV2_{name}_stage1.pth')   # 本地路径
+                if os.path.exists(model_path):   # 本地存在
+                    state = torch.load(model_path, map_location='cpu')   # 加载状态字典
+                    print(f"Loaded stage1 {name} HGNetV2 from local file.")   # 打印信息
+                else:              # 需要下载
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():   # 分布式
+                        rank0 = (torch.distributed.get_rank() == 0)   # 是否rank0
                     else:
-                        if torch.distributed.is_available() and torch.distributed.is_initialized():
-                            rank0 = (torch.distributed.get_rank() == 0)
-                        else:
-                            rank0 = True
-                        if rank0:
-                            print(GREEN + "If the pretrained HGNetV2 can't be downloaded automatically. Please check your network connection." + RESET)
-                            print(GREEN + "Please check your network connection. Or download the model manually from " + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)
-                            state = torch.hub.load_state_dict_from_url(download_url, map_location='cpu', model_dir=local_model_dir)
-                            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                                torch.distributed.barrier()
-                        else:
-                            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                                torch.distributed.barrier()
-                            state = torch.load(model_path, map_location='cpu')
-
-                        print(f"Loaded stage1 {name} HGNetV2 from URL.")
-
-                    # 仅把原版 stem & stages 的权重加载到 RGB 分支；HVI 分支随机初始化
-                    missing, unexpected = self._load_partial_pretrain(state_dict=state)
-                    if len(unexpected) > 0:
-                        print(RED + f"Unexpected keys in state_dict (ignored): {unexpected}" + RESET)
-                    if len(missing) > 0:
-                        print(RED + f"Missing keys not loaded (new modules or HVI branch): {missing}" + RESET)
-
-                except (Exception, KeyboardInterrupt) as e:
-                    print(f"{str(e)}")
-                    logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)
-                    logging.error(GREEN + "Please check your network connection. Or download the model manually from " \
-                                + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)
-                    # 不直接 exit()，避免影响训练流程
-                    # exit()
+                        rank0 = True   # 非分布式视为rank0
+                    if rank0:        # rank0负责下载
+                        print(GREEN + "If the pretrained HGNetV2 can't be downloaded automatically. Please check your network connection." + RESET)   # 提示
+                        print(GREEN + "Please check your network connection. Or download the model manually from " + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)   # 指导
+                        state = torch.hub.load_state_dict_from_url(download_url, map_location='cpu', model_dir=local_model_dir)   # 下载
+                        if torch.distributed.is_available() and torch.distributed.is_initialized():   # 同步
+                            torch.distributed.barrier()   # 等待所有进程
+                    else:            # 非rank0等待下载完成
+                        if torch.distributed.is_available() and torch.distributed.is_initialized():   # 同步
+                            torch.distributed.barrier()   # 等待rank0
+                        state = torch.load(model_path, map_location='cpu')   # 加载本地文件
+                    print(f"Loaded stage1 {name} HGNetV2 from URL.")   # 打印信息
+                # 部分加载：stem→stem_rgb, stages→stages_rgb
+                missing, unexpected = self._load_partial_pretrain(state_dict=state)   # 非严格加载
+                if len(unexpected) > 0:   # 有意外键
+                    print(RED + f"Unexpected keys in state_dict (ignored): {unexpected}" + RESET)   # 打印警告
+                if len(missing) > 0:      # 有缺失键
+                    print(RED + f"Missing keys not loaded (new modules or HVI branch): {missing}" + RESET)   # 打印缺失
+            except (Exception, KeyboardInterrupt) as e:   # 异常处理
+                print(f"{str(e)}")        # 打印异常
+                logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)   # 错误日志
+                logging.error(GREEN + "Please check your network connection. Or download the model manually from " \
+                            + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)   # 指导
+                # 不直接exit()，避免影响训练
 
     # --------- utils ---------
-    def _freeze_norm(self, m: nn.Module):
-        if isinstance(m, nn.BatchNorm2d):
-            m = FrozenBatchNorm2d(m.num_features)
-        else:
-            for name, child in m.named_children():
-                _child = self._freeze_norm(child)
-                if _child is not child:
-                    setattr(m, name, _child)
-        return m
+    def _freeze_norm(self, m: nn.Module):   # 递归冻结BN层
+        if isinstance(m, nn.BatchNorm2d):   # 如果是BatchNorm2d
+            m = FrozenBatchNorm2d(m.num_features)   # 替换为冻结版本
+        else:                         # 否则遍历子模块
+            for name, child in m.named_children():   # 遍历子模块
+                _child = self._freeze_norm(child)    # 递归处理
+                if _child is not child:   # 如果返回了新模块
+                    setattr(m, name, _child)   # 替换
+        return m                      # 返回模块
 
-    def _freeze_parameters(self, m: nn.Module):
-        for p in m.parameters():
-            p.requires_grad = False
+    def _freeze_parameters(self, m: nn.Module):   # 冻结模块所有参数
+        for p in m.parameters():      # 遍历参数
+            p.requires_grad = False   # 禁止梯度
 
-    @torch.no_grad()
-    def _load_partial_pretrain(self, state_dict):
-        """
-        把原版 HGNetV2 的权重尽可能加载到 RGB 分支（键名匹配），其余跳过。
-        """
-        # 构建一个“镜像”state_dict：把原模型里 stem -> stem_rgb, stages -> stages_rgb
-        new_state = {}
-        for k, v in state_dict.items():
-            nk = k
-            if k.startswith('stem.'):
-                nk = 'stem_rgb.' + k[len('stem.'):]
-            elif k.startswith('stages.'):
-                nk = 'stages_rgb.' + k[len('stages.'):]
-            new_state[nk] = v
-
-        missing, unexpected = self.load_state_dict(new_state, strict=False)
-        return missing, unexpected
+    @torch.no_grad()                  # 不计算梯度
+    def _load_partial_pretrain(self, state_dict):   # 部分加载预训练权重
+        """把原版HGNetV2的权重加载到RGB分支，其余跳过"""
+        new_state = {}                # 新状态字典
+        for k, v in state_dict.items():   # 遍历原字典
+            nk = k                    # 默认键名
+            if k.startswith('stem.'):   # stem前缀
+                nk = 'stem_rgb.' + k[len('stem.'):]   # 改为stem_rgb
+            elif k.startswith('stages.'):   # stages前缀
+                nk = 'stages_rgb.' + k[len('stages.'):]   # 改为stages_rgb
+            new_state[nk] = v         # 存入新字典
+        missing, unexpected = self.load_state_dict(new_state, strict=False)   # 非严格加载
+        return missing, unexpected    # 返回缺失和多余键
 
     # --------- forward ---------
-    def forward(self, x):
+    def forward(self, x):             # 前向传播
         """
         x: RGB, shape [B,3,H,W]
         流程：
@@ -448,34 +383,31 @@ class HGNetv2_pcrt(nn.Module):
           3) 在 stage2 / stage3 的输出处做交互融合（更新两支为相同的 fused）
           4) 返回按照 return_idx 的 fused 特征
         """
-        # 1) RGB -> HVI 模态（直接使用 HVI 三通道，不再还原）
-        # with torch.no_grad():
-            # 如果你希望 HVI 也可训练地参与梯度，这里去掉 no_grad()
-        hvi = self.rgb2hvi.forward_rgb_to_prct(x)  # [B,3,H,W]
+        # 1) RGB -> HVI 模态
+        hvi = self.rgb2hvi.forward_rgb_to_prct(x)   # 生成PRCT(HVI)特征
 
         # 2) 两支各自 stem
-        xr = self.stem_rgb(x)   # [B, Cstem, H/4, W/4]
-        xh = self.stem_hvi(hvi) # [B, Cstem, H/4, W/4]
+        xr = self.stem_rgb(x)         # RGB分支stem → [B,Cstem,H/4,W/4]
+        xh = self.stem_hvi(hvi)       # HVI分支stem → [B,Cstem,H/4,W/4]
 
-        outs = []
-        # 3) 逐 stage 前向 & 中层融合
-        for idx, (stage_r, stage_h) in enumerate(zip(self.stages_rgb, self.stages_hvi)):
-            xr = stage_r(xr)
-            xh = stage_h(xh)
+        outs = []                     # 存储输出特征
+        # 3) 逐stage前向 + 中层融合
+        for idx, (stage_r, stage_h) in enumerate(zip(self.stages_rgb, self.stages_hvi)):   # 同时遍历两分支
+            xr = stage_r(xr)          # RGB阶段前向
+            xh = stage_h(xh)          # HVI阶段前向
 
-            # 在 stage2 / stage3 做交互（注意：idx从0开始 -> 1是stage2，2是stage3）
-            if idx == 1:  # stage2
-                fused = self.fuse2(xr, xh)
-                xr = fused
-                xh = fused
-            if idx == 2:  # stage3
-                fused = self.fuse3(xr, xh)
-                xr = fused
-                xh = fused
+            # 在 stage2 / stage3 交互融合
+            if idx == 1:              # stage2
+                fused = self.fuse2(xr, xh)   # 融合特征
+                xr = fused            # RGB分支更新为融合结果
+                xh = fused            # HVI分支更新为融合结果
+            if idx == 2:              # stage3
+                fused = self.fuse3(xr, xh)   # 融合特征
+                xr = fused            # RGB分支更新
+                xh = fused            # HVI分支更新
 
-            # 收集输出（返回 fused）
-            if idx in self.return_idx:
-                # 两支已被同步为 fused，取任意一支即可
-                outs.append(xr)
+            # 收集需要返回的特征
+            if idx in self.return_idx:   # 当前阶段需要返回
+                outs.append(xr)       # 添加融合后的特征（两分支相同）
 
-        return outs
+        return outs                   # 返回特征列表
