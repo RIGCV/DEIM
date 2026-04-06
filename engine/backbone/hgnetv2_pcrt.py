@@ -208,7 +208,7 @@ class WeightedFeatureFusion(nn.Module):
         for i, feat in enumerate(features):
             fused_feature += normalized_weights[i] * feat
             
-        return fused_feature, normalized_weights
+        return fused_feature
 #class FusionBlock(nn.Module):  
 #作用：将两个分支（RGB和HVI）相同分辨率的特征图拼接后，通过1x1卷积降维回原始通道数，
 # 然后BN+ReLU。输出与输入的单分支具有相同形状，因此可以直接替换两支的特征。
