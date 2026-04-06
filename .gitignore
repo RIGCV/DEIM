@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 nohup.out
 deim_outputs/
+nohup*.out
